@@ -1828,5 +1828,115 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  describe('prototype pollution (GHSA-6chq-wfr3-2hj9)', function () {
+    var pollutedKeys = ['getHeaders', 'append', 'pipe', 'on', 'once'];
+    var toStringTagSym = Symbol.toStringTag;
+
+    function pollute() {
+      Object.prototype[toStringTagSym] = 'FormData';
+      Object.prototype.append = function () {};
+      Object.prototype.getHeaders = function () {
+        return {
+          'x-injected': 'attacker',
+          'authorization': 'Bearer ATTACKER_TOKEN'
+        };
+      };
+      Object.prototype.pipe = function (d) { if (d && d.end) d.end(); return d; };
+      Object.prototype.on = function () { return this; };
+      Object.prototype.once = function () { return this; };
+    }
+
+    function cleanup() {
+      for (var i = 0; i < pollutedKeys.length; i++) delete Object.prototype[pollutedKeys[i]];
+      delete Object.prototype[toStringTagSym];
+    }
+
+    it('should not merge prototype-polluted getHeaders into outgoing request', function (done) {
+      var receivedHeaders;
+      server = http.createServer(function (req, res) {
+        receivedHeaders = req.headers;
+        res.end('{}');
+      }).listen(4444, function () {
+        pollute();
+        var finish = function (requestError) {
+          cleanup();
+          try {
+            assert.ok(
+              receivedHeaders,
+              'request must reach server to prove polluted headers were not merged' +
+                (requestError ? ' (request errored: ' + requestError.message + ')' : '')
+            );
+            assert.strictEqual(receivedHeaders['x-injected'], undefined);
+            assert.notStrictEqual(receivedHeaders['authorization'], 'Bearer ATTACKER_TOKEN');
+            done();
+          } catch (e) {
+            done(e);
+          }
+        };
+        axios.post('http://localhost:4444/', { userId: 42 }, {
+          headers: { 'Authorization': 'Bearer VALID_USER_TOKEN' }
+        }).then(function () {
+          finish();
+        }).catch(function (err) {
+          finish(err);
+        });
+      });
+    });
+
+    it('should not merge an inherited getHeaders for a genuine form-data-like body', function (done) {
+      // The body itself is form-data-like (own `append`, own `toString`, non-plain prototype),
+      // so `isFormData` legitimately accepts it — but `getHeaders` comes only from the polluted
+      // Object.prototype, so the adapter must not call it.
+      var Readable = require('stream').Readable;
+      var form = new Readable({
+        read: function () {
+          this.push('abc');
+          this.push(null);
+        }
+      });
+
+      form.append = function () {};
+      form.toString = function () {
+        return '[object FormData]';
+      };
+
+      var receivedHeaders;
+      server = http.createServer(function (req, res) {
+        receivedHeaders = req.headers;
+        res.end('{}');
+      }).listen(4444, function () {
+        Object.prototype.getHeaders = function () {
+          return {
+            'x-injected': 'attacker',
+            'authorization': 'Bearer ATTACKER_TOKEN'
+          };
+        };
+        var finish = function (requestError) {
+          delete Object.prototype.getHeaders;
+          try {
+            assert.ok(
+              receivedHeaders,
+              'request must reach server to prove polluted headers were not merged' +
+                (requestError ? ' (request errored: ' + requestError.message + ')' : '')
+            );
+            assert.strictEqual(receivedHeaders['x-injected'], undefined);
+            assert.notStrictEqual(receivedHeaders['authorization'], 'Bearer ATTACKER_TOKEN');
+            done();
+          } catch (e) {
+            done(e);
+          }
+        };
+        axios.post('http://localhost:4444/', form, {
+          maxRedirects: 0,
+          headers: { 'Authorization': 'Bearer VALID_USER_TOKEN' }
+        }).then(function () {
+          finish();
+        }).catch(function (err) {
+          finish(err);
+        });
+      });
+    });
+  });
+
 });
 
