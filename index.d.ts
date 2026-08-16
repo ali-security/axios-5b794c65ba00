@@ -110,6 +110,7 @@ export interface AxiosRequestConfig<D = any> {
   env?: {
     FormData?: new (...args: any[]) => object;
   };
+  withXSRFToken?: boolean | ((config: AxiosRequestConfig) => boolean | undefined);
 }
 
 export interface HeadersDefaults {
