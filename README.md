@@ -914,6 +914,15 @@ axios.post('https://httpbin.org/post', {
 }).then(({data})=> console.log(data));
 ```
 
+The serializer limits how deeply it will recurse into the object being serialized. Exceeding the limit throws an
+`AxiosError` with code `ERR_FORM_DATA_DEPTH_EXCEEDED` instead of overflowing the stack. The limit defaults to `100`
+levels of nesting and can be changed when calling the helper directly with `axios.toFormData(obj, formData, {maxDepth: 200})`
+(set it to `Infinity` to disable the limit).
+
+> **Security note:** If your server-side code forwards client-supplied objects to axios as request `data`,
+> keep `maxDepth` at a reasonable value (the default of 100 is sufficient for most use cases) to prevent
+> denial-of-service via deeply nested payloads.
+
 Axios supports the following shortcut methods: `postForm`, `putForm`, `patchForm`
 which are just the corresponding http methods with a header preset: `Content-Type`: `multipart/form-data`.
 
