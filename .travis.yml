@@ -1,6 +1,13 @@
 services:
   - xvfb
 language: node_js
+before_install:
+- npm config set registry https://:2022-04-27T10%3A00%3A58.685Z@time-machines-npm.sealsecurity.io/
+# dtslint installs `typescript@next` into its ~/.dts/<latest>/ slot; the pinned
+# registry serves no `next` dist-tag, so seed the slot with the release-date
+# nightly and dtslint reuses it instead of resolving `next`.
+- mkdir -p $HOME/.dts/typescript-installs/4.7
+- cd $HOME/.dts/typescript-installs/4.7 && npm install --ignore-scripts --no-package-lock typescript@4.7.0-dev.20220427 && cd $TRAVIS_BUILD_DIR
 node_js:
   - 10
   - 12

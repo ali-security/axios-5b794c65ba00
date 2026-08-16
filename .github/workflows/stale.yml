@@ -1,12 +1,12 @@
 name: 'Close Stale'
 
 on:
-  schedule:
-    - cron: '0 0 * * 1'
+  workflow_dispatch:
 
 jobs:
   stale:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Close Stale Issues
         uses: actions/stale@v3

@@ -1,12 +1,12 @@
 name: 'Close Invalid Issues'
 
 on:
-  issues:
-    types: [opened]
+  workflow_dispatch:
 
 jobs:
   auto_close_issues:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v2

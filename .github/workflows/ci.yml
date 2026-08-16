@@ -1,24 +1,56 @@
 name: ci
 
 on:
-  push:
-    branches: [master, 'release/*', dev]
-  pull_request:
-    branches: [master, 'release/*', dev]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [12.x, 14.x, 16.x]
+        node-version: [18.x, 12.x, 14.x, 16.x]
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Setup node
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+      - name: Pin npm registry to the release-date time machine
+        run: npm config set registry https://:2022-04-27T10%3A00%3A58.685Z@time-machines-npm.sealsecurity.io/
+      # dtslint installs `typescript@next` into its ~/.dts/<latest>/ slot; the pinned
+      # registry serves no `next` dist-tag, so seed the slot with the release-date
+      # nightly and dtslint reuses it instead of resolving `next`.
+      - name: Seed dtslint's typescript@next slot
+        run: |
+          mkdir -p "$HOME/.dts/typescript-installs/4.7"
+          cd "$HOME/.dts/typescript-installs/4.7"
+          npm install --ignore-scripts --no-package-lock typescript@4.7.0-dev.20220427
       - run: npm install
+      # webpack 4 (karma-webpack) hashes with md4, which OpenSSL 3 on Node 17+ refuses.
+      # NODE_OPTIONS is not settable through $GITHUB_ENV, so scope it to this step.
       - run: npm test
+        env:
+          NODE_OPTIONS: ${{ startsWith(matrix.node-version, '18') && '--openssl-legacy-provider' || '' }}
+
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.x
+      - name: Pin npm registry to the release-date time machine
+        run: npm config set registry https://:2022-04-27T10%3A00%3A58.685Z@time-machines-npm.sealsecurity.io/
+      - run: npm install
+      - run: npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axios-tgz
+          path: axios-0.27.2.tgz
+          if-no-files-found: error
