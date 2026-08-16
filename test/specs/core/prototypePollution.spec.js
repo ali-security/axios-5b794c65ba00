@@ -10,6 +10,7 @@ describe('Prototype Pollution Protection', function() {
     delete Object.prototype.password;
     delete Object.prototype.common;
     delete Object.prototype.proxy;
+    delete Object.prototype['Content-Type'];
   }
 
   // Defensive: clear before and after each test so pollution leaking from
@@ -24,21 +25,21 @@ describe('Prototype Pollution Protection', function() {
 
       expect(Object.prototype.polluted).toBeUndefined();
       expect(result.safe).toEqual('value');
-      expect(result.hasOwnProperty('__proto__')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result, '__proto__')).toBe(false);
     });
 
     it('should filter constructor key at top level', function() {
       var result = utils.merge({}, {constructor: {polluted: 'yes'}, safe: 'value'});
 
       expect(result.safe).toEqual('value');
-      expect(result.hasOwnProperty('constructor')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result, 'constructor')).toBe(false);
     });
 
     it('should filter prototype key at top level', function() {
       var result = utils.merge({}, {prototype: {polluted: 'yes'}, safe: 'value'});
 
       expect(result.safe).toEqual('value');
-      expect(result.hasOwnProperty('prototype')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result, 'prototype')).toBe(false);
     });
 
     it('should filter __proto__ key in nested objects', function() {
@@ -51,7 +52,7 @@ describe('Prototype Pollution Protection', function() {
 
       expect(Object.prototype.polluted).toBeUndefined();
       expect(result.headers['Content-Type']).toEqual('application/json');
-      expect(result.headers.hasOwnProperty('__proto__')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result.headers, '__proto__')).toBe(false);
     });
 
     it('should filter constructor key in nested objects', function() {
@@ -64,7 +65,7 @@ describe('Prototype Pollution Protection', function() {
 
       expect(Object.prototype.polluted).toBeUndefined();
       expect(result.headers['Content-Type']).toEqual('application/json');
-      expect(result.headers.hasOwnProperty('constructor')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result.headers, 'constructor')).toBe(false);
     });
 
     it('should filter prototype key in nested objects', function() {
@@ -76,7 +77,7 @@ describe('Prototype Pollution Protection', function() {
       });
 
       expect(result.headers['Content-Type']).toEqual('application/json');
-      expect(result.headers.hasOwnProperty('prototype')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result.headers, 'prototype')).toBe(false);
     });
 
     it('should filter dangerous keys in deeply nested objects', function() {
@@ -92,7 +93,9 @@ describe('Prototype Pollution Protection', function() {
 
       expect(Object.prototype.polluted).toBeUndefined();
       expect(result.level1.level2.safe).toEqual('value');
-      expect(result.level1.level2.hasOwnProperty('__proto__')).toBe(false);
+      expect(
+        Object.prototype.hasOwnProperty.call(result.level1.level2, '__proto__')
+      ).toBe(false);
     });
 
     it('should still merge regular properties correctly', function() {
@@ -109,7 +112,7 @@ describe('Prototype Pollution Protection', function() {
       var result = utils.merge({}, malicious);
 
       expect(Object.prototype.polluted).toBeUndefined();
-      expect(result.hasOwnProperty('__proto__')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result, '__proto__')).toBe(false);
     });
 
     it('should handle nested JSON.parse payloads safely', function() {
@@ -117,7 +120,7 @@ describe('Prototype Pollution Protection', function() {
       var result = utils.merge({}, malicious);
 
       expect(Object.prototype.polluted).toBeUndefined();
-      expect(result.headers.hasOwnProperty('constructor')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result.headers, 'constructor')).toBe(false);
     });
 
     it('should not merge incoming values into an inherited target', function() {
@@ -130,8 +133,12 @@ describe('Prototype Pollution Protection', function() {
       });
 
       expect(result.proxy.host).toEqual('localhost');
-      expect(result.proxy.hasOwnProperty('auth')).toBe(false);
-      expect(result.proxy.hasOwnProperty('username')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result.proxy, 'auth')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result.proxy, 'username')).toBe(false);
+      // Nothing can be read off the prototype chain either: the merged object has none.
+      expect(Object.getPrototypeOf(result.proxy)).toBe(null);
+      expect(result.proxy.auth).toBeUndefined();
+      expect(result.proxy.username).toBeUndefined();
     });
 
     it('should not copy polluted inherited header buckets into nested headers', function() {
@@ -146,7 +153,23 @@ describe('Prototype Pollution Protection', function() {
       });
 
       expect(result.headers.common.Accept).toEqual('application/json');
-      expect(result.headers.common.hasOwnProperty('x-polluted-common')).toBe(false);
+      expect(
+        Object.prototype.hasOwnProperty.call(result.headers.common, 'x-polluted-common')
+      ).toBe(false);
+      expect(Object.getPrototypeOf(result.headers)).toBe(null);
+      expect(Object.getPrototypeOf(result.headers.common)).toBe(null);
+    });
+
+    it('should not surface an inherited header value from a merged headers object', function() {
+      // Read-side gadget: `Content-Type` is read straight off the merged headers
+      // object to pick the request body encoding, so an inherited value is enough
+      // to change what axios puts on the wire.
+      Object.prototype['Content-Type'] = 'multipart/form-data';
+
+      var headers = utils.merge({}, {Accept: 'application/json'});
+
+      expect(headers['Content-Type']).toBeUndefined();
+      expect(headers.Accept).toEqual('application/json');
     });
   });
 
@@ -179,7 +202,7 @@ describe('Prototype Pollution Protection', function() {
 
       expect(Object.prototype.polluted).toBeUndefined();
       expect(result.headers['Content-Type']).toEqual('application/json');
-      expect(result.headers.hasOwnProperty('__proto__')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(result.headers, '__proto__')).toBe(false);
     });
 
     it('should filter dangerous keys in custom config properties', function() {
@@ -192,7 +215,9 @@ describe('Prototype Pollution Protection', function() {
 
       expect(Object.prototype.polluted).toBeUndefined();
       expect(result.customProp.safe).toEqual('value');
-      expect(result.customProp.hasOwnProperty('__proto__')).toBe(false);
+      expect(
+        Object.prototype.hasOwnProperty.call(result.customProp, '__proto__')
+      ).toBe(false);
     });
 
     it('should still merge configs correctly', function() {

@@ -28,6 +28,7 @@ describe('Prototype Pollution Protection (node)', function () {
     delete Object.prototype.env;
     delete Object.prototype.parseReviver;
     delete Object.prototype.headers;
+    delete Object.prototype['Content-Type'];
   }
 
   // Defensive: clear before and after each test so pollution leaking from
@@ -67,6 +68,69 @@ describe('Prototype Pollution Protection (node)', function () {
         Object.prototype.hasOwnProperty.call(result.headers.common, 'x-polluted-common'),
         false
       );
+    });
+
+    it('should create nested plain objects that do not inherit proxy credentials', function () {
+      // Read-side gadget: the merged object used to inherit from Object.prototype, so
+      // `result.proxy.auth` resolved to the attacker's value even though nothing ever
+      // merged an `auth` key in - and the http adapter then turned it into credentials.
+      Object.prototype.auth = 'polluted';
+      Object.prototype.username = 'polluted-user';
+      Object.prototype.password = 'polluted-pass';
+
+      var result = utils.merge({}, {
+        proxy: {
+          host: 'localhost',
+          nested: {
+            enabled: true
+          }
+        }
+      });
+
+      assert.strictEqual(Object.getPrototypeOf(result), null);
+      assert.strictEqual(Object.getPrototypeOf(result.proxy), null);
+      assert.strictEqual(Object.getPrototypeOf(result.proxy.nested), null);
+      assert.strictEqual(result.proxy.host, 'localhost');
+      assert.strictEqual(result.proxy.auth, undefined);
+      assert.strictEqual(result.proxy.username, undefined);
+      assert.strictEqual(result.proxy.password, undefined);
+      assert.strictEqual(result.proxy.nested.auth, undefined);
+    });
+
+    it('should create null-prototype header buckets that cannot read polluted values', function () {
+      Object.prototype.common = {'x-polluted-common': 'yes'};
+      Object.prototype.get = {'x-polluted-get': 'yes'};
+
+      var result = utils.merge({}, {
+        headers: {
+          common: {
+            Accept: 'application/json'
+          },
+          get: {
+            'x-own-get': 'yes'
+          }
+        }
+      });
+
+      assert.strictEqual(result.headers.common.Accept, 'application/json');
+      assert.strictEqual(result.headers.get['x-own-get'], 'yes');
+      assert.strictEqual(result.headers.common['x-polluted-common'], undefined);
+      assert.strictEqual(result.headers.get['x-polluted-get'], undefined);
+      assert.strictEqual(Object.getPrototypeOf(result.headers), null);
+      assert.strictEqual(Object.getPrototypeOf(result.headers.common), null);
+      assert.strictEqual(Object.getPrototypeOf(result.headers.get), null);
+    });
+
+    it('should not surface an inherited header value from a merged headers object', function () {
+      // `Content-Type` is read straight off the merged headers object by
+      // defaults.transformRequest to pick the body encoding, so an inherited value
+      // is enough to change what axios puts on the wire.
+      Object.prototype['Content-Type'] = 'multipart/form-data';
+
+      var headers = utils.merge({}, {Accept: 'application/json'});
+
+      assert.strictEqual(headers['Content-Type'], undefined);
+      assert.strictEqual(headers.Accept, 'application/json');
     });
   });
 
@@ -200,6 +264,77 @@ describe('Prototype Pollution Protection (node)', function () {
       assert.strictEqual(Object.prototype.hasOwnProperty.call(result.headers, 'X-Evil'), false);
       assert.strictEqual(result.headers['X-Evil'], undefined);
     });
+
+    it('should create nested plain config objects that do not inherit proxy credentials', function () {
+      Object.prototype.auth = 'polluted';
+      Object.prototype.username = 'polluted-user';
+      Object.prototype.password = 'polluted-pass';
+
+      var result = mergeConfig({}, {
+        proxy: {
+          host: 'localhost',
+          port: 4000
+        }
+      });
+
+      assert.strictEqual(Object.getPrototypeOf(result.proxy), null);
+      assert.strictEqual(result.proxy.auth, undefined);
+      assert.strictEqual(result.proxy.username, undefined);
+      assert.strictEqual(result.proxy.password, undefined);
+    });
+
+    it('should not throw when Object.prototype get and set are polluted', function () {
+      // A property descriptor built as an object literal inherits the polluted
+      // accessors, so `Object.defineProperty` rejects it as both an accessor and a
+      // data descriptor - turning pollution into a synchronous throw on every request.
+      Object.prototype.get = function () {};
+      Object.prototype.set = function () {};
+
+      assert.doesNotThrow(function () {
+        mergeConfig({}, {
+          url: '/users',
+          headers: {
+            common: {
+              Accept: 'application/json'
+            }
+          }
+        });
+      });
+    });
+
+    it('should prepare request headers without descriptor errors when get and set are polluted', function (done) {
+      Object.prototype.get = function () {};
+      Object.prototype.set = function () {};
+
+      var instance = axios.create({
+        adapter: function adapter(config) {
+          assert.strictEqual(config.headers.Accept, 'application/json');
+          return Promise.resolve({
+            data: null,
+            status: 200,
+            statusText: 'OK',
+            headers: {},
+            config: config
+          });
+        },
+        headers: {
+          common: {
+            Accept: 'application/json'
+          }
+        }
+      });
+
+      // Clear as soon as the request settles rather than waiting for `afterEach`:
+      // polluted accessors on Object.prototype are hostile to any library that builds
+      // a property descriptor as an object literal, mocha's own runner included.
+      instance.get('/users').then(function () {
+        clearPollution();
+        done();
+      }).catch(function (error) {
+        clearPollution();
+        done(error);
+      });
+    });
   });
 
   describe('http adapter', function () {
@@ -235,6 +370,37 @@ describe('Prototype Pollution Protection (node)', function () {
         }).catch(done);
       });
     });
+
+    it('should not let an inherited Content-Type change the body put on the wire', function (done) {
+      // End-to-end form of the read-side gadget: nothing sets `Content-Type` on this
+      // request, so a polluted Object.prototype used to decide how the payload was
+      // encoded and what the server actually received.
+      Object.prototype['Content-Type'] = 'multipart/form-data';
+
+      var received = null;
+
+      server = http.createServer(function (req, res) {
+        var body = '';
+        req.on('data', function (chunk) {
+          body += chunk;
+        });
+        req.on('end', function () {
+          received = {contentType: req.headers['content-type'], body: body};
+          res.setHeader('Content-Type', 'text/plain');
+          res.end('ok');
+        });
+      }).listen(4444, function () {
+        axios.post('http://localhost:4444/', {field: 'value'}).then(function () {
+          clearPollution();
+          assert.strictEqual(received.contentType, 'application/json');
+          assert.strictEqual(received.body, '{"field":"value"}');
+          done();
+        }).catch(function (error) {
+          clearPollution();
+          done(error);
+        });
+      });
+    });
   });
 
   describe('defaults.transformRequest', function () {
@@ -265,6 +431,19 @@ describe('Prototype Pollution Protection (node)', function () {
       }
 
       assert.strictEqual(hijacked, false);
+    });
+
+    it('should not read an inherited Content-Type when choosing the body encoding', function () {
+      // The merged headers object used to inherit from Object.prototype, so a polluted
+      // `Content-Type` was read back here and switched every object payload from JSON
+      // to multipart form data - handing the body to a different serializer.
+      Object.prototype['Content-Type'] = 'multipart/form-data';
+
+      var headers = utils.merge({}, {});
+      var data = transformData.call({}, {field: 'value'}, headers, defaults.transformRequest);
+
+      assert.strictEqual(data, '{"field":"value"}');
+      assert.strictEqual(headers['Content-Type'], 'application/json');
     });
   });
 
