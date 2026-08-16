@@ -384,6 +384,270 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  describe('stale Proxy-Authorization on redirect (GHSA-j5f8-grm9-p9fc)', function () {
+    var setProxy = require('../../../lib/adapters/http').__setProxy;
+
+    function basic(credentials) {
+      return 'Basic ' + Buffer.from(credentials, 'utf8').toString('base64');
+    }
+
+    it('should strip stale proxy credentials when the redirected request uses a proxy without credentials', function () {
+      var options = {
+        headers: {},
+        hostname: 'initial.example.com',
+        host: 'initial.example.com',
+        port: 80
+      };
+
+      setProxy(
+        options,
+        { host: '127.0.0.1', port: 8030, auth: { username: 'user', password: 'pass' } },
+        'http://initial.example.com/start'
+      );
+      assert.equal(
+        options.headers['Proxy-Authorization'],
+        basic('user:pass'),
+        'initial request should carry Proxy-Authorization'
+      );
+
+      // Redirect re-invocation: the redirected request is routed through a proxy
+      // that has no credentials of its own, so nothing may be replayed.
+      var redirectOptions = {
+        headers: { 'Proxy-Authorization': options.headers['Proxy-Authorization'] },
+        hostname: 'attacker.example.com',
+        host: 'attacker.example.com',
+        port: 443
+      };
+      setProxy(redirectOptions, { host: '127.0.0.2', port: 8031 }, 'http://attacker.example.com/final', true);
+
+      assert.strictEqual(
+        redirectOptions.headers['Proxy-Authorization'],
+        undefined,
+        'stale Proxy-Authorization must be stripped from the redirected request'
+      );
+    });
+
+    it('should strip stale proxy credentials on redirect regardless of header casing', function () {
+      var casings = ['proxy-authorization', 'PROXY-AUTHORIZATION', 'Proxy-authorization', 'pRoXy-AuThOrIzAtIoN'];
+
+      for (var i = 0; i < casings.length; i++) {
+        var headers = {};
+        headers[casings[i]] = basic('user:pass');
+
+        var redirectOptions = {
+          headers: headers,
+          hostname: 'attacker.example.com',
+          host: 'attacker.example.com',
+          port: 443
+        };
+        setProxy(redirectOptions, { host: '127.0.0.2', port: 8031 }, 'http://attacker.example.com/final', true);
+
+        var leaked = Object.keys(redirectOptions.headers).filter(function isProxyAuth(name) {
+          return name.toLowerCase() === 'proxy-authorization';
+        });
+        assert.deepEqual(
+          leaked,
+          [],
+          'stale Proxy-Authorization with key "' + casings[i] + '" must be stripped regardless of casing'
+        );
+      }
+    });
+
+    it('should replace stale proxy credentials with those of the proxy used after the redirect', function () {
+      var redirectOptions = {
+        headers: { 'pRoXy-AuThOrIzAtIoN': basic('user:pass') },
+        hostname: 'second.example.com',
+        host: 'second.example.com',
+        port: 80
+      };
+
+      setProxy(
+        redirectOptions,
+        { host: '127.0.0.2', port: 8031, auth: { username: 'user2', password: 'pass2' } },
+        'http://second.example.com/final',
+        true
+      );
+
+      assert.equal(
+        redirectOptions.headers['Proxy-Authorization'],
+        basic('user2:pass2'),
+        'credentials of the proxy handling the redirected request must be used'
+      );
+      assert.strictEqual(
+        redirectOptions.headers['pRoXy-AuThOrIzAtIoN'],
+        undefined,
+        'the stale header must not survive alongside the fresh one'
+      );
+    });
+
+    it('should preserve a caller-supplied Proxy-Authorization header on the initial request', function () {
+      var userValue = basic('alice:secret');
+      var options = {
+        headers: { 'Proxy-Authorization': userValue },
+        hostname: 'example.com',
+        host: 'example.com',
+        port: 80
+      };
+
+      setProxy(options, { host: '127.0.0.1', port: 8030 }, 'http://example.com/start');
+
+      assert.equal(
+        options.headers['Proxy-Authorization'],
+        userValue,
+        'a caller-supplied Proxy-Authorization must not be stripped on the initial request'
+      );
+    });
+
+    it('should strip stale proxy credentials from the redirect hook installed on the request', function () {
+      var options = {
+        headers: {},
+        hostname: 'initial.example.com',
+        host: 'initial.example.com',
+        port: 80
+      };
+
+      setProxy(options, { host: '127.0.0.1', port: 8030 }, 'http://initial.example.com/start');
+      assert.equal(typeof options.beforeRedirect, 'function', 'setProxy must install a redirect hook');
+
+      var redirection = {
+        headers: { 'Proxy-Authorization': basic('user:pass') },
+        host: 'attacker.example.com',
+        href: 'http://attacker.example.com/final'
+      };
+      options.beforeRedirect(redirection);
+
+      assert.strictEqual(
+        redirection.headers['Proxy-Authorization'],
+        undefined,
+        'the redirect hook must strip credentials carried over from the previous request'
+      );
+    });
+
+    it('should not replay a caller-supplied Proxy-Authorization header on the redirected request', function (done) {
+      var staleValue = basic('user:pass');
+      var seenByProxy = [];
+      var requestCount = 0;
+
+      server = http.createServer(function (req, res) {
+        requestCount += 1;
+        if (requestCount === 1) {
+          res.setHeader('Location', 'http://localhost:4444/final');
+          res.statusCode = 302;
+        }
+        res.end('ok');
+      }).listen(4444, function () {
+        proxy = http.createServer(function (request, response) {
+          seenByProxy.push(request.headers['proxy-authorization']);
+
+          var parsed = url.parse(request.url);
+          http.get({
+            host: parsed.hostname,
+            port: parsed.port,
+            path: parsed.path
+          }, function (res) {
+            response.writeHead(res.statusCode, res.headers);
+            res.on('data', function (data) {
+              response.write(data);
+            });
+            res.on('end', function () {
+              response.end();
+            });
+          });
+        }).listen(4000, function () {
+          axios.get('http://localhost:4444/', {
+            proxy: {
+              host: 'localhost',
+              port: 4000
+            },
+            maxRedirects: 1,
+            headers: {
+              'Proxy-Authorization': staleValue
+            }
+          }).then(function (res) {
+            assert.equal(res.data, 'ok');
+            assert.equal(seenByProxy.length, 2, 'both requests should be routed through the proxy');
+            assert.equal(seenByProxy[0], staleValue, 'the initial request keeps the caller-supplied header');
+            assert.strictEqual(
+              seenByProxy[1],
+              undefined,
+              'stale credentials must not be replayed on the redirected request'
+            );
+            done();
+          }).catch(done);
+        });
+      });
+    });
+
+    it('should not leak proxy credentials to the redirect target when a custom beforeRedirect is set', function (done) {
+      var targetHeaders = null;
+      var hookCalls = 0;
+      var target = http.createServer(function (req, res) {
+        targetHeaders = req.headers;
+        res.end('final');
+      });
+
+      function finish(error) {
+        target.close();
+        done(error);
+      }
+
+      target.listen(4445, function () {
+        server = http.createServer(function (req, res) {
+          res.setHeader('Location', 'http://127.0.0.1:4445/final');
+          res.statusCode = 302;
+          res.end();
+        }).listen(4444, function () {
+          proxy = http.createServer(function (request, response) {
+            var parsed = url.parse(request.url);
+            http.get({
+              host: parsed.hostname,
+              port: parsed.port,
+              path: parsed.path
+            }, function (res) {
+              response.writeHead(res.statusCode, res.headers);
+              res.on('data', function (data) {
+                response.write(data);
+              });
+              res.on('end', function () {
+                response.end();
+              });
+            });
+          }).listen(4000, function () {
+            axios.get('http://localhost:4444/', {
+              proxy: {
+                host: 'localhost',
+                port: 4000,
+                auth: {
+                  username: 'user',
+                  password: 'pass'
+                }
+              },
+              maxRedirects: 1,
+              beforeRedirect: function (options) {
+                hookCalls += 1;
+                assert.equal(typeof options, 'object');
+              }
+            }).then(function (res) {
+              try {
+                assert.equal(res.data, 'final');
+                assert.equal(hookCalls, 1, 'a caller-supplied beforeRedirect must still be invoked');
+                assert.ok(targetHeaders, 'the redirect target should have been reached');
+                assert.strictEqual(
+                  targetHeaders['proxy-authorization'],
+                  undefined,
+                  'proxy credentials must never reach the redirect target'
+                );
+                finish();
+              } catch (e) {
+                finish(e);
+              }
+            }).catch(finish);
+          });
+        });
+      });
+    });
+  });
+
   it('should preserve the HTTP verb on redirect', function (done) {
     server = http.createServer(function (req, res) {
       if (req.method.toLowerCase() !== "head") {
