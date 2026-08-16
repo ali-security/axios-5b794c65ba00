@@ -2,10 +2,21 @@ var utils = require('../../../lib/utils');
 var mergeConfig = require('../../../lib/core/mergeConfig');
 
 describe('Prototype Pollution Protection', function() {
-  afterEach(function() {
+  function clearPollution() {
     // Clean up any pollution that might have occurred
     delete Object.prototype.polluted;
-  });
+    delete Object.prototype.auth;
+    delete Object.prototype.username;
+    delete Object.prototype.password;
+    delete Object.prototype.common;
+    delete Object.prototype.proxy;
+  }
+
+  // Defensive: clear before and after each test so pollution leaking from
+  // another spec cannot poison the first test here, and a failure mid-test
+  // cannot poison the next one.
+  beforeEach(clearPollution);
+  afterEach(clearPollution);
 
   describe('utils.merge', function() {
     it('should filter __proto__ key at top level', function() {
@@ -107,6 +118,35 @@ describe('Prototype Pollution Protection', function() {
 
       expect(Object.prototype.polluted).toBeUndefined();
       expect(result.headers.hasOwnProperty('constructor')).toBe(false);
+    });
+
+    it('should not merge incoming values into an inherited target', function() {
+      Object.prototype.proxy = {auth: 'polluted', username: 'polluted-user'};
+
+      var result = utils.merge({}, {
+        proxy: {
+          host: 'localhost'
+        }
+      });
+
+      expect(result.proxy.host).toEqual('localhost');
+      expect(result.proxy.hasOwnProperty('auth')).toBe(false);
+      expect(result.proxy.hasOwnProperty('username')).toBe(false);
+    });
+
+    it('should not copy polluted inherited header buckets into nested headers', function() {
+      Object.prototype.common = {'x-polluted-common': 'yes'};
+
+      var result = utils.merge({}, {
+        headers: {
+          common: {
+            Accept: 'application/json'
+          }
+        }
+      });
+
+      expect(result.headers.common.Accept).toEqual('application/json');
+      expect(result.headers.common.hasOwnProperty('x-polluted-common')).toBe(false);
     });
   });
 

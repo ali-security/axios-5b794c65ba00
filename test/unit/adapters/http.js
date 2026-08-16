@@ -2,6 +2,11 @@ var axios = require('../../../index');
 var http = require('http');
 var https = require('https');
 var net = require('net');
+// Pre-load `dns` so it isn't lazy-required from inside an http request
+// after a test pollutes `Object.prototype.get` — on older Node versions
+// the lazy `Object.defineProperty` call in dns.js inherits the polluted
+// getter and throws "Getter must be a function".
+require('dns');
 var url = require('url');
 var zlib = require('zlib');
 var assert = require('assert');
@@ -14,6 +19,18 @@ var FormData = require('form-data');
 var formidable = require('formidable');
 
 describe('supports http with nodejs', function () {
+
+  function clearPrototypePollution() {
+    delete Object.prototype.auth;
+    delete Object.prototype.username;
+    delete Object.prototype.password;
+    delete Object.prototype.common;
+    delete Object.prototype.get;
+    delete Object.prototype.post;
+  }
+
+  // Defensive: clear before each test in case another suite left pollution.
+  beforeEach(clearPrototypePollution);
 
   afterEach(function () {
     if (server) {
@@ -29,6 +46,7 @@ describe('supports http with nodejs', function () {
     delete process.env.https_proxy;
     delete process.env.no_proxy;
     delete process.env.NO_PROXY;
+    clearPrototypePollution();
   });
 
   it('should sanitize request headers containing invalid characters', function (done) {
@@ -292,6 +310,76 @@ describe('supports http with nodejs', function () {
       }).catch(function (error) {
         assert.equal(error.message, 'Provided path is not allowed');
         done();
+      });
+    });
+  });
+
+  it('should remove proxy authorization case-insensitively when no proxy applies', function (done) {
+    server = http.createServer(function (req, res) {
+      assert.equal(req.headers['proxy-authorization'], undefined);
+      res.end('ok');
+    }).listen(4444, function () {
+      process.env.HTTP_PROXY = 'http://localhost:4000/';
+      process.env.NO_PROXY = 'localhost';
+
+      axios.get('http://localhost:4444/', {
+        headers: {
+          'pRoXy-AuThOrIzAtIoN': 'Basic stale'
+        }
+      }).then(function (res) {
+        assert.equal(res.data, 'ok');
+        done();
+      }).catch(done);
+    });
+  });
+
+  it('should keep proxy authorization when redirected request still uses authenticated proxy', function (done) {
+    var requestCount = 0;
+    var proxyAuth = 'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64');
+
+    server = http.createServer(function (req, res) {
+      requestCount += 1;
+      if (requestCount === 1) {
+        res.setHeader('Location', 'http://localhost:4444/final');
+        res.statusCode = 302;
+      }
+      res.end('ok');
+    }).listen(4444, function () {
+      var proxyUseCount = 0;
+
+      proxy = http.createServer(function (request, response) {
+        proxyUseCount += 1;
+        assert.equal(request.headers['proxy-authorization'], proxyAuth);
+
+        var parsed = url.parse(request.url);
+        var opts = {
+          host: parsed.hostname,
+          port: parsed.port,
+          path: parsed.path
+        };
+
+        http.get(opts, function (res) {
+          response.writeHead(res.statusCode, res.headers);
+          res.on('data', function (data) {
+            response.write(data);
+          });
+          res.on('end', function () {
+            response.end();
+          });
+        });
+      }).listen(4000, function () {
+        axios.get('http://localhost:4444/', {
+          proxy: {
+            host: 'localhost',
+            port: 4000,
+            auth: 'user:pass'
+          },
+          maxRedirects: 1
+        }).then(function (res) {
+          assert.equal(res.data, 'ok');
+          assert.equal(proxyUseCount, 2);
+          done();
+        }).catch(done);
       });
     });
   });
@@ -577,6 +665,33 @@ describe('supports http with nodejs', function () {
     }).listen(socketName, function () {
       axios({
         socketPath: socketName,
+        allowedSocketPaths: socketName,
+        url: '/'
+      })
+        .then(function (resp) {
+          assert.equal(resp.status, 200);
+          assert.equal(resp.statusText, 'OK');
+          done();
+        })
+        .catch(done);
+    });
+  });
+
+  it('should support sockets without an allowlist', function (done) {
+    // Different sockets for win32 vs darwin/linux
+    var socketName = './test.sock';
+
+    if (process.platform === 'win32') {
+      socketName = '\\\\.\\pipe\\libuv-test';
+    }
+
+    server = net.createServer(function (socket) {
+      socket.on('data', function () {
+        socket.end('HTTP/1.1 200 OK\r\n\r\n');
+      });
+    }).listen(socketName, function () {
+      axios({
+        socketPath: socketName,
         url: '/'
       })
         .then(function (resp) {
@@ -589,6 +704,140 @@ describe('supports http with nodejs', function () {
           done();
         });
     });
+  });
+
+  it('should reject disallowed socket paths before opening the socket', function (done) {
+    var socketName = './test.sock';
+    var openedSocket = false;
+
+    if (process.platform === 'win32') {
+      socketName = '\\\\.\\pipe\\libuv-test';
+    }
+
+    server = net.createServer(function (socket) {
+      openedSocket = true;
+      socket.end('HTTP/1.1 200 OK\r\n\r\n');
+    }).listen(socketName, function () {
+      axios({
+        socketPath: socketName,
+        allowedSocketPaths: './other.sock',
+        url: '/'
+      })
+        .then(function () {
+          done(new Error('request should not succeed'));
+        })
+        .catch(function (err) {
+          assert.equal(err.code, AxiosError.ERR_BAD_OPTION_VALUE);
+          assert.equal(openedSocket, false);
+          done();
+        });
+    });
+  });
+
+  it('should reject socket paths when allowlist is empty', function (done) {
+    var socketName = './test.sock';
+    var openedSocket = false;
+
+    if (process.platform === 'win32') {
+      socketName = '\\\\.\\pipe\\libuv-test';
+    }
+
+    server = net.createServer(function (socket) {
+      openedSocket = true;
+      socket.end('HTTP/1.1 200 OK\r\n\r\n');
+    }).listen(socketName, function () {
+      axios({
+        socketPath: socketName,
+        allowedSocketPaths: [],
+        url: '/'
+      })
+        .then(function () {
+          done(new Error('request should not succeed'));
+        })
+        .catch(function (err) {
+          assert.equal(err.code, AxiosError.ERR_BAD_OPTION_VALUE);
+          assert.equal(openedSocket, false);
+          done();
+        });
+    });
+  });
+
+  it('should inherit and clear socket path allowlists', function (done) {
+    var socketName = './test.sock';
+    var instance;
+
+    if (process.platform === 'win32') {
+      socketName = '\\\\.\\pipe\\libuv-test';
+    }
+
+    server = net.createServer(function (socket) {
+      socket.on('data', function () {
+        socket.end('HTTP/1.1 200 OK\r\n\r\n');
+      });
+    }).listen(socketName, function () {
+      instance = axios.create({
+        allowedSocketPaths: socketName
+      });
+
+      instance({
+        socketPath: socketName,
+        url: '/'
+      })
+        .then(function (resp) {
+          assert.equal(resp.status, 200);
+
+          return axios.create({
+            allowedSocketPaths: []
+          })({
+            socketPath: socketName,
+            allowedSocketPaths: null,
+            url: '/'
+          });
+        })
+        .then(function (resp) {
+          assert.equal(resp.status, 200);
+          done();
+        })
+        .catch(done);
+    });
+  });
+
+  it('should reject invalid socket path options', function (done) {
+    axios({
+      socketPath: {},
+      url: '/'
+    })
+      .then(function () {
+        done(new Error('request should not succeed'));
+      })
+      .catch(function (err) {
+        assert.equal(err.code, AxiosError.ERR_BAD_OPTION_VALUE);
+
+        return axios({
+          socketPath: './test.sock',
+          allowedSocketPaths: {},
+          url: '/'
+        });
+      })
+      .then(function () {
+        done(new Error('request should not succeed'));
+      })
+      .catch(function (err) {
+        assert.equal(err.code, AxiosError.ERR_BAD_OPTION_VALUE);
+
+        return axios({
+          socketPath: './test.sock',
+          allowedSocketPaths: ['./test.sock', {}],
+          url: '/'
+        });
+      })
+      .then(function () {
+        done(new Error('request should not succeed'));
+      })
+      .catch(function (err) {
+        assert.equal(err.code, AxiosError.ERR_BAD_OPTION_VALUE);
+        done();
+      });
   });
 
   it('should support streams', function (done) {
@@ -1112,6 +1361,104 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should not use inherited proxy auth credentials', function (done) {
+    Object.prototype.auth = {};
+    Object.prototype.username = 'polluted-user';
+    Object.prototype.password = 'polluted-pass';
+
+    server = http.createServer(function (req, res) {
+      res.end();
+    }).listen(4444, function () {
+      proxy = http.createServer(function (request, response) {
+        var parsed = url.parse(request.url);
+        // Null-prototype options: the polluted `auth` must not leak into the
+        // proxy's own onward request either.
+        var opts = Object.create(null);
+        opts.host = parsed.hostname;
+        opts.port = parsed.port;
+        opts.path = parsed.path;
+        opts.auth = undefined;
+        var proxyAuth = request.headers['proxy-authorization'];
+
+        http.get(opts, function (res) {
+          res.on('data', function () {});
+          res.on('end', function () {
+            response.setHeader('Content-Type', 'text/html; charset=UTF-8');
+            response.end(proxyAuth || '');
+          });
+        });
+      }).listen(4000, function () {
+        axios.get('http://localhost:4444/', {
+          proxy: {
+            host: 'localhost',
+            port: 4000
+          }
+        }).then(function (res) {
+          assert.equal(res.data, '');
+          done();
+        }).catch(done);
+      });
+    });
+  });
+
+  it('should not send inherited header buckets on GET requests', function (done) {
+    var inheritedHeaderBuckets = Object.create(null);
+    inheritedHeaderBuckets.common = { 'x-polluted-common': 'yes' };
+    inheritedHeaderBuckets.get = { 'x-polluted-get': 'yes' };
+
+    server = http.createServer(function (req, res) {
+      assert.strictEqual(req.headers['x-polluted-common'], undefined);
+      assert.strictEqual(req.headers['x-polluted-get'], undefined);
+      assert.strictEqual(req.headers['x-request'], 'request');
+      res.end('ok');
+    }).listen(4444, function () {
+      var requestHeaders = Object.create(inheritedHeaderBuckets);
+      requestHeaders['x-request'] = 'request';
+
+      axios.get('http://localhost:4444/', {
+        headers: requestHeaders
+      }).then(function () {
+        done();
+      }).catch(done);
+    });
+  });
+
+  it('should not send inherited header buckets on requests with a body', function (done) {
+    server = http.createServer(function (req, res) {
+      assert.strictEqual(req.headers['x-polluted-common'], undefined);
+      assert.strictEqual(req.headers['x-polluted-post'], undefined);
+      assert.strictEqual(req.headers['x-own-common'], 'default');
+      assert.strictEqual(req.headers['x-own-post'], 'method');
+      assert.strictEqual(req.headers['x-request'], 'request');
+      req.on('data', function () {});
+      req.on('end', function () {
+        res.end('ok');
+      });
+    }).listen(4444, function () {
+      Object.prototype.common = { 'x-polluted-common': 'yes' };
+      Object.prototype.post = { 'x-polluted-post': 'yes' };
+
+      var instance = axios.create({
+        headers: {
+          common: {
+            'x-own-common': 'default'
+          },
+          post: {
+            'x-own-post': 'method'
+          }
+        }
+      });
+
+      instance.post('http://localhost:4444/', 'body', {
+        headers: {
+          'x-request': 'request'
+        }
+      }).then(function () {
+        done();
+      }).catch(done);
+    });
+  });
+
   it('should support proxy auth with header', function (done) {
     server = http.createServer(function (req, res) {
       res.end();
@@ -1324,6 +1671,118 @@ describe('supports http with nodejs', function () {
         assert.strictEqual(error.code, 'ERR_BAD_RESPONSE');
         assert.strictEqual(error.message, 'maxContentLength size of -1 exceeded');
         done();
+      });
+    });
+  });
+
+  describe('FormData header policy', function () {
+    function createFormDataLikeStream(headers) {
+      var Readable = require('stream').Readable;
+      var form = Readable.from(['abc']);
+
+      form.append = function () {};
+      form.getHeaders = function () {
+        return headers;
+      };
+      form.toString = function () {
+        return '[object FormData]';
+      };
+
+      return form;
+    }
+
+    function postFormDataLike(headers, config) {
+      config = config || {};
+      config.maxRedirects = 0;
+
+      return axios.post('http://localhost:4444/', createFormDataLikeStream(headers), config);
+    }
+
+    it('should preserve FormData getHeaders headers by default', function (done) {
+      server = http.createServer(function (req, res) {
+        res.end(JSON.stringify(req.headers));
+      }).listen(4444, function () {
+        postFormDataLike({
+          'content-type': 'multipart/form-data; boundary=test',
+          'content-length': '3',
+          host: 'evil.example',
+          authorization: 'Bearer ATTACKER_TOKEN',
+          'x-forwarded-for': '127.0.0.2',
+          'x-injected': 'yes'
+        }).then(function (res) {
+          assert.strictEqual(res.data['content-type'], 'multipart/form-data; boundary=test');
+          assert.strictEqual(res.data['content-length'], '3');
+          assert.strictEqual(res.data.host, 'evil.example');
+          assert.strictEqual(res.data.authorization, 'Bearer ATTACKER_TOKEN');
+          assert.strictEqual(res.data['x-forwarded-for'], '127.0.0.2');
+          assert.strictEqual(res.data['x-injected'], 'yes');
+          done();
+        }).catch(done);
+      });
+    });
+
+    it('should preserve FormData getHeaders headers for legacy policy', function (done) {
+      server = http.createServer(function (req, res) {
+        res.end(JSON.stringify(req.headers));
+      }).listen(4444, function () {
+        postFormDataLike({
+          'content-type': 'multipart/form-data; boundary=test',
+          'content-length': '3',
+          host: 'evil.example',
+          authorization: 'Bearer ATTACKER_TOKEN',
+          'x-forwarded-for': '127.0.0.2',
+          'x-injected': 'yes'
+        }, { formDataHeaderPolicy: 'legacy' }).then(function (res) {
+          assert.strictEqual(res.data.host, 'evil.example');
+          assert.strictEqual(res.data.authorization, 'Bearer ATTACKER_TOKEN');
+          assert.strictEqual(res.data['x-forwarded-for'], '127.0.0.2');
+          assert.strictEqual(res.data['x-injected'], 'yes');
+          done();
+        }).catch(done);
+      });
+    });
+
+    it('should constrain FormData getHeaders headers for content-only policy', function (done) {
+      server = http.createServer(function (req, res) {
+        res.end(JSON.stringify(req.headers));
+      }).listen(4444, function () {
+        postFormDataLike({
+          'Content-Type': 'multipart/form-data; boundary=test',
+          'Content-Length': '3',
+          host: 'evil.example',
+          authorization: 'Bearer ATTACKER_TOKEN',
+          'x-forwarded-for': '127.0.0.2',
+          'x-injected': 'yes'
+        }, { formDataHeaderPolicy: 'content-only' }).then(function (res) {
+          assert.strictEqual(res.data['content-type'], 'multipart/form-data; boundary=test');
+          assert.strictEqual(res.data['content-length'], '3');
+          assert.notStrictEqual(res.data.host, 'evil.example');
+          assert.notStrictEqual(res.data.authorization, 'Bearer ATTACKER_TOKEN');
+          assert.strictEqual(res.data['x-forwarded-for'], undefined);
+          assert.strictEqual(res.data['x-injected'], undefined);
+          done();
+        }).catch(done);
+      });
+    });
+
+    it('should keep explicit request headers with content-only policy', function (done) {
+      server = http.createServer(function (req, res) {
+        res.end(JSON.stringify(req.headers));
+      }).listen(4444, function () {
+        postFormDataLike({
+          'content-type': 'multipart/form-data; boundary=test',
+          'content-length': '3',
+          'x-injected': 'yes'
+        }, {
+          formDataHeaderPolicy: 'content-only',
+          headers: {
+            'x-caller-header': 'allowed'
+          }
+        }).then(function (res) {
+          assert.strictEqual(res.data['x-caller-header'], 'allowed');
+          assert.strictEqual(res.data['x-injected'], undefined);
+          done();
+        }).catch(done);
       });
     });
   });
