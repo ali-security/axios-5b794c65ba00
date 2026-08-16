@@ -72,4 +72,11 @@ describe('helpers::buildURL', function () {
   it('should support URLSearchParams', function () {
     expect(buildURL('/foo', new URLSearchParams('bar=baz'))).toEqual('/foo?bar=baz');
   });
+
+  it('should not reverse the safe percent-encoding of null bytes (GHSA-xhjh-pmcv-23jw)', function () {
+    var serialized = buildURL('/foo', {name: 'foo\x00.jpg'});
+
+    expect(serialized.indexOf('\x00')).toEqual(-1);
+    expect(/%00/.test(serialized)).toBe(true);
+  });
 });

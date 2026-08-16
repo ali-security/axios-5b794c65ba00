@@ -23,6 +23,7 @@ describe('Prototype Pollution Protection (node)', function () {
     delete Object.prototype.transport;
     delete Object.prototype.transformRequest;
     delete Object.prototype.transformResponse;
+    delete Object.prototype.adapter;
     delete Object.prototype.formSerializer;
     delete Object.prototype.env;
     delete Object.prototype.parseReviver;
@@ -133,28 +134,48 @@ describe('Prototype Pollution Protection (node)', function () {
 
   describe('mergeConfig', function () {
     it('should not inherit transport from Object.prototype', function () {
-      Object.prototype.transport = {request: function () {}};
+      var polluted = {request: function () {}};
+      Object.prototype.transport = polluted;
 
       var result = mergeConfig({}, {url: '/a'});
 
-      assert.strictEqual(result.hasOwnProperty('transport'), false);
       assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'transport'), false);
+      // Reading via the prototype chain must not surface the polluted value.
+      assert.strictEqual(result.transport, undefined);
+      assert.notStrictEqual(result.transport, polluted);
     });
 
     it('should not inherit transformRequest from Object.prototype', function () {
-      Object.prototype.transformRequest = function () { return 'hijacked'; };
+      var polluted = function () { return 'hijacked'; };
+      Object.prototype.transformRequest = polluted;
 
       var result = mergeConfig({}, {url: '/a'});
 
       assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'transformRequest'), false);
+      assert.strictEqual(result.transformRequest, undefined);
+      assert.notStrictEqual(result.transformRequest, polluted);
     });
 
     it('should not inherit transformResponse from Object.prototype', function () {
-      Object.prototype.transformResponse = function () { return 'hijacked'; };
+      var polluted = function () { return 'hijacked'; };
+      Object.prototype.transformResponse = polluted;
 
       var result = mergeConfig({}, {url: '/a'});
 
       assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'transformResponse'), false);
+      assert.strictEqual(result.transformResponse, undefined);
+      assert.notStrictEqual(result.transformResponse, polluted);
+    });
+
+    it('should not inherit adapter from Object.prototype', function () {
+      var polluted = function () { return 'hijacked'; };
+      Object.prototype.adapter = polluted;
+
+      var result = mergeConfig({}, {url: '/a'});
+
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'adapter'), false);
+      assert.strictEqual(result.adapter, undefined);
+      assert.notStrictEqual(result.adapter, polluted);
     });
 
     it('should not inherit arbitrary keys from Object.prototype', function () {
@@ -163,6 +184,7 @@ describe('Prototype Pollution Protection (node)', function () {
       var result = mergeConfig({}, {url: '/a'});
 
       assert.strictEqual(Object.prototype.hasOwnProperty.call(result, 'polluted'), false);
+      assert.strictEqual(result.polluted, undefined);
     });
 
     it('should not merge an inherited value of the other config into an own property', function () {

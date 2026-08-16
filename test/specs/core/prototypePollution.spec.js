@@ -161,9 +161,12 @@ describe('Prototype Pollution Protection', function() {
 
       expect(Object.prototype.polluted).toBeUndefined();
       expect(result.url).toEqual('/api/test');
-      expect(result.hasOwnProperty('__proto__')).toBe(false);
-      expect(result.hasOwnProperty('constructor')).toBe(false);
-      expect(result.hasOwnProperty('prototype')).toBe(false);
+      // `result` is created with a null prototype, so it has no `hasOwnProperty`
+      // method of its own to call.
+      var hasOwn = Object.prototype.hasOwnProperty;
+      expect(hasOwn.call(result, '__proto__')).toBe(false);
+      expect(hasOwn.call(result, 'constructor')).toBe(false);
+      expect(hasOwn.call(result, 'prototype')).toBe(false);
     });
 
     it('should filter dangerous keys in headers', function() {
