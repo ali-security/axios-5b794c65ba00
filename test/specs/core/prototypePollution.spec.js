@@ -10,7 +10,38 @@ describe('Prototype Pollution Protection', function() {
     delete Object.prototype.password;
     delete Object.prototype.common;
     delete Object.prototype.proxy;
+    delete Object.prototype.paramsSerializer;
+    delete Object.prototype.serialize;
+    delete Object.prototype.encode;
     delete Object.prototype['Content-Type'];
+  }
+
+  // Define the gadget as a non-enumerable property: a real polluted prototype is
+  // still readable through the chain, but staying out of `for..in` keeps the
+  // pollution from disturbing the test runner itself.
+  function pollute(prop, value) {
+    Object.defineProperty(Object.prototype, prop, {
+      value: value,
+      configurable: true,
+      writable: true,
+      enumerable: false
+    });
+  }
+
+  // Reproduces the real-world shape of the attack: a request interceptor that
+  // returns `Object.assign({}, config)` hands the adapter a plain object, which
+  // puts Object.prototype back in the config's prototype chain even though
+  // mergeConfig had produced a null-prototype object.
+  function cloneConfigInterceptor(config) {
+    var clone = {};
+
+    for (var key in config) {
+      if (Object.prototype.hasOwnProperty.call(config, key)) {
+        clone[key] = config[key];
+      }
+    }
+
+    return clone;
   }
 
   // Defensive: clear before and after each test so pollution leaking from
@@ -248,6 +279,135 @@ describe('Prototype Pollution Protection', function() {
       expect(result.timeout).toEqual(5000);
       expect(result.headers.common.Accept).toEqual('application/json');
       expect(result.headers.common['Content-Type']).toEqual('application/json');
+    });
+  });
+
+  describe('xhr adapter', function() {
+    beforeEach(function() {
+      jasmine.Ajax.install();
+    });
+
+    afterEach(function() {
+      jasmine.Ajax.uninstall();
+      clearPollution();
+    });
+
+    it('should not send inherited basic auth credentials after config cloning', function(done) {
+      // `config.auth.username` / `config.auth.password` used to be read straight
+      // off a placeholder `auth: {}`, so a polluted Object.prototype turned an
+      // empty credentials object into a real `Authorization: Basic` header.
+      pollute('username', 'polluted-user');
+      pollute('password', 'polluted-pass');
+
+      var instance = axios.create();
+
+      instance.interceptors.request.use(function(config) {
+        var clone = cloneConfigInterceptor(config);
+        clone.auth = {};
+        return clone;
+      });
+
+      instance.get('/foo');
+
+      setTimeout(function() {
+        var request = jasmine.Ajax.requests.mostRecent();
+        var authorization = request.requestHeaders['Authorization'];
+
+        clearPollution();
+
+        expect(authorization).not.toEqual('Basic ' + btoa('polluted-user:polluted-pass'));
+        expect(authorization).toEqual('Basic ' + btoa(':'));
+        done();
+      }, 100);
+    });
+
+    it('should not send an inherited auth object after config cloning', function(done) {
+      // The whole `auth` object can be inherited too: nothing configures
+      // credentials for this request, so `config.auth` used to resolve through the
+      // polluted prototype and authenticate with attacker-controlled credentials.
+      pollute('auth', {
+        username: 'polluted-user',
+        password: 'polluted-pass'
+      });
+
+      var instance = axios.create();
+
+      instance.interceptors.request.use(cloneConfigInterceptor);
+
+      instance.get('/foo');
+
+      setTimeout(function() {
+        var request = jasmine.Ajax.requests.mostRecent();
+        var authorization = request.requestHeaders['Authorization'];
+
+        clearPollution();
+
+        expect(authorization).toBeUndefined();
+        done();
+      }, 100);
+    });
+
+    it('should not use an inherited paramsSerializer after config cloning', function(done) {
+      // An inherited `paramsSerializer` used to take over query-string building
+      // and could redirect or rewrite every parameter axios puts on the wire.
+      pollute('paramsSerializer', function pollutedSerializer() {
+        return 'polluted=1';
+      });
+
+      var instance = axios.create();
+
+      instance.interceptors.request.use(cloneConfigInterceptor);
+
+      instance.get('/foo', {
+        params: {
+          safe: '1'
+        }
+      });
+
+      setTimeout(function() {
+        var request = jasmine.Ajax.requests.mostRecent();
+        var url = request.url;
+
+        clearPollution();
+
+        expect(url).toEqual('/foo?safe=1');
+        done();
+      }, 100);
+    });
+
+    it('should not use an inherited serializer carried by a paramsSerializer object', function(done) {
+      // buildURL also accepts `{serialize, encode}`; both must be read as own
+      // properties so a polluted prototype cannot supply either one.
+      pollute('serialize', function pollutedSerialize() {
+        return 'polluted=1';
+      });
+      pollute('encode', function pollutedEncode() {
+        return 'polluted';
+      });
+
+      var instance = axios.create();
+
+      instance.interceptors.request.use(function(config) {
+        var clone = cloneConfigInterceptor(config);
+        clone.paramsSerializer = {};
+        return clone;
+      });
+
+      instance.get('/foo', {
+        params: {
+          safe: '1'
+        }
+      });
+
+      setTimeout(function() {
+        var request = jasmine.Ajax.requests.mostRecent();
+        var url = request.url;
+
+        clearPollution();
+
+        expect(url).toEqual('/foo?safe=1');
+        done();
+      }, 100);
     });
   });
 });

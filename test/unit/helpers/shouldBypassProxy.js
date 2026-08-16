@@ -99,6 +99,44 @@ describe('helpers::shouldBypassProxy', function () {
     assert.strictEqual(shouldBypassProxy('http://127.0.0.1:8081/'), false);
   });
 
+  it('should treat 0.0.0.0 as a local address for no_proxy matching', function () {
+    setNoProxy('localhost,127.0.0.1,::1');
+
+    assert.strictEqual(shouldBypassProxy('http://0.0.0.0:8080/'), true);
+  });
+
+  it('should keep 0.0.0.0 no_proxy matching port-aware', function () {
+    setNoProxy('localhost:8080');
+
+    assert.strictEqual(shouldBypassProxy('http://0.0.0.0:8080/'), true);
+    assert.strictEqual(shouldBypassProxy('http://0.0.0.0:8081/'), false);
+  });
+
+  it('should treat the IPv6 unspecified address as a local address', function () {
+    setNoProxy('localhost,127.0.0.1,::1');
+
+    assert.strictEqual(shouldBypassProxy('http://[::]:8080/'), true);
+    assert.strictEqual(shouldBypassProxy('http://[0:0:0:0:0:0:0:0]:8080/'), true);
+  });
+
+  it('should support the unspecified address as a no_proxy entry', function () {
+    setNoProxy('0.0.0.0');
+
+    assert.strictEqual(shouldBypassProxy('http://localhost:8080/'), true);
+    assert.strictEqual(shouldBypassProxy('http://127.0.0.1:8080/'), true);
+
+    setNoProxy('::');
+
+    assert.strictEqual(shouldBypassProxy('http://localhost:8080/'), true);
+  });
+
+  it('should not treat non-zero IPv6 addresses as unspecified', function () {
+    setNoProxy('localhost');
+
+    assert.strictEqual(shouldBypassProxy('http://[::2]:8080/'), false);
+    assert.strictEqual(shouldBypassProxy('http://[2001:db8::1]:8080/'), false);
+  });
+
   it('should bypass proxy for IPv4-mapped IPv6 loopback when IPv4 is listed', function () {
     setNoProxy('127.0.0.1');
 

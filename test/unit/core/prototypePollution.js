@@ -19,7 +19,11 @@ describe('Prototype Pollution Protection (node)', function () {
     delete Object.prototype.get;
     delete Object.prototype.post;
     delete Object.prototype.set;
+    delete Object.prototype.data;
     delete Object.prototype.proxy;
+    delete Object.prototype.paramsSerializer;
+    delete Object.prototype.serialize;
+    delete Object.prototype.encode;
     delete Object.prototype.transport;
     delete Object.prototype.transformRequest;
     delete Object.prototype.transformResponse;
@@ -333,6 +337,56 @@ describe('Prototype Pollution Protection (node)', function () {
       }).catch(function (error) {
         clearPollution();
         done(error);
+      });
+    });
+  });
+
+  describe('request method aliases', function () {
+    function dispatchWithAdapter(run) {
+      var seen;
+
+      return run({
+        transformRequest: [],
+        transformResponse: [],
+        adapter: function adapter(config) {
+          seen = config;
+          return Promise.resolve({
+            data: null,
+            status: 200,
+            statusText: 'OK',
+            headers: {},
+            config: config
+          });
+        }
+      }).then(function () {
+        return seen;
+      });
+    }
+
+    // `axios.get`/`delete`/`head`/`options` are bodyless, but they used to copy
+    // `(config || {}).data` into the merged config - so a polluted
+    // Object.prototype turned every one of them into a request carrying an
+    // attacker-controlled body.
+    ['delete', 'get', 'head', 'options'].forEach(function (method) {
+      it('should not copy inherited data into the bodyless ' + method + ' alias', function () {
+        Object.prototype.data = 'polluted';
+
+        return dispatchWithAdapter(function (config) {
+          return axios[method]('/users', config);
+        }).then(function (config) {
+          assert.strictEqual(config.data, undefined);
+        });
+      });
+    });
+
+    it('should still send an explicitly configured data value for bodyless aliases', function () {
+      Object.prototype.data = 'polluted';
+
+      return dispatchWithAdapter(function (config) {
+        config.data = 'own';
+        return axios.get('/users', config);
+      }).then(function (config) {
+        assert.strictEqual(config.data, 'own');
       });
     });
   });

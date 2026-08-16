@@ -27,6 +27,10 @@ describe('supports http with nodejs', function () {
     delete Object.prototype.common;
     delete Object.prototype.get;
     delete Object.prototype.post;
+    delete Object.prototype.proxy;
+    delete Object.prototype.paramsSerializer;
+    delete Object.prototype.serialize;
+    delete Object.prototype.encode;
   }
 
   // Defensive: clear before each test in case another suite left pollution.
@@ -772,6 +776,90 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should normalize nullish own basic auth credentials to empty strings', function (done) {
+    server = http.createServer(function (req, res) {
+      res.end(req.headers.authorization);
+    }).listen(4444, function () {
+      axios.get('http://localhost:4444/', {
+        auth: {
+          username: undefined,
+          password: null
+        }
+      }).then(function (res) {
+        assert.equal(res.data, 'Basic ' + Buffer.from(':', 'utf8').toString('base64'));
+        done();
+      }).catch(done);
+    });
+  });
+
+  it('should not use inherited basic auth credentials after config cloning', function (done) {
+    // A request interceptor that clones the config with `Object.assign({}, config)`
+    // hands the adapter a plain object again, so `config.auth.username` used to
+    // resolve through a polluted Object.prototype and be sent as credentials.
+    Object.prototype.username = 'polluted-user';
+    Object.prototype.password = 'polluted-pass';
+
+    server = http.createServer(function (req, res) {
+      res.end(req.headers.authorization || '');
+    }).listen(4444, function () {
+      var instance = axios.create();
+      var polluted = 'Basic ' + Buffer.from('polluted-user:polluted-pass', 'utf8').toString('base64');
+
+      instance.interceptors.request.use(function (config) {
+        var clone = Object.assign({}, config);
+        clone.auth = {};
+        return clone;
+      });
+
+      instance.get('http://localhost:4444/').then(function (res) {
+        clearPrototypePollution();
+        try {
+          assert.notStrictEqual(res.data, polluted);
+          assert.equal(res.data, 'Basic ' + Buffer.from(':', 'utf8').toString('base64'));
+          done();
+        } catch (e) {
+          done(e);
+        }
+      }).catch(function (error) {
+        clearPrototypePollution();
+        done(error);
+      });
+    });
+  });
+
+  it('should not use an inherited auth object after config cloning', function (done) {
+    // The whole `auth` object can be inherited too: nothing configures credentials
+    // here, so `config.auth` used to resolve through the polluted Object.prototype
+    // and silently authenticate the request with attacker-controlled credentials.
+    Object.prototype.auth = {
+      username: 'polluted-user',
+      password: 'polluted-pass'
+    };
+
+    server = http.createServer(function (req, res) {
+      res.end(req.headers.authorization || '');
+    }).listen(4444, function () {
+      var instance = axios.create();
+
+      instance.interceptors.request.use(function (config) {
+        return Object.assign({}, config);
+      });
+
+      instance.get('http://localhost:4444/').then(function (res) {
+        clearPrototypePollution();
+        try {
+          assert.equal(res.data, '');
+          done();
+        } catch (e) {
+          done(e);
+        }
+      }).catch(function (error) {
+        clearPrototypePollution();
+        done(error);
+      });
+    });
+  });
+
   it('should provides a default User-Agent header', function (done) {
     server = http.createServer(function (req, res) {
       res.end(req.headers['user-agent']);
@@ -1486,6 +1574,30 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should not use proxy for 0.0.0.0 when no_proxy is localhost', function (done) {
+    var proxyRequests = 0;
+
+    server = http.createServer(function (req, res) {
+      res.end('bypassed');
+    }).listen(4444, '0.0.0.0', function () {
+      proxy = http.createServer(function (request, response) {
+        proxyRequests += 1;
+        response.end('proxied');
+      }).listen(4000, function () {
+        process.env.http_proxy = 'http://localhost:4000/';
+        process.env.HTTP_PROXY = 'http://localhost:4000/';
+        process.env.no_proxy = 'localhost,127.0.0.1,::1';
+        process.env.NO_PROXY = 'localhost,127.0.0.1,::1';
+
+        axios.get('http://0.0.0.0:4444/').then(function (res) {
+          assert.equal(res.data, 'bypassed');
+          assert.equal(proxyRequests, 0, 'should not use proxy for 0.0.0.0');
+          done();
+        }).catch(done);
+      });
+    });
+  });
+
   it('should not use proxy for [::1] when no_proxy is localhost', function (done) {
     var proxyRequests = 0;
 
@@ -1661,6 +1773,92 @@ describe('supports http with nodejs', function () {
           assert.equal(res.data, '');
           done();
         }).catch(done);
+      });
+    });
+  });
+
+  it('should not use inherited proxy after a request interceptor clones the config', function (done) {
+    // `Object.assign({}, config)` restores Object.prototype in the config's
+    // prototype chain, so an inherited `proxy` used to route the request - and
+    // every credential it carries - through an attacker-controlled proxy.
+    var proxyRequests = 0;
+
+    process.env.no_proxy = 'localhost,127.0.0.1,::1';
+    process.env.NO_PROXY = 'localhost,127.0.0.1,::1';
+
+    server = http.createServer(function (req, res) {
+      res.end('target');
+    }).listen(4444, function () {
+      proxy = http.createServer(function (request, response) {
+        proxyRequests += 1;
+        response.end('proxy');
+      }).listen(4000, function () {
+        Object.prototype.proxy = {
+          protocol: 'http',
+          host: 'localhost',
+          port: 4000
+        };
+
+        var instance = axios.create();
+
+        instance.interceptors.request.use(function (config) {
+          var clone = Object.assign({}, config);
+          clone.headers = Object.assign({}, config.headers);
+          return clone;
+        });
+
+        instance.get('http://localhost:4444/secret', {
+          headers: {
+            Authorization: 'Bearer test'
+          }
+        }).then(function (res) {
+          clearPrototypePollution();
+          try {
+            assert.equal(res.data, 'target');
+            assert.equal(proxyRequests, 0);
+            done();
+          } catch (e) {
+            done(e);
+          }
+        }).catch(function (error) {
+          clearPrototypePollution();
+          done(error);
+        });
+      });
+    });
+  });
+
+  it('should not use inherited paramsSerializer after a request interceptor clones the config', function (done) {
+    Object.prototype.paramsSerializer = {
+      serialize: function serialize() {
+        return 'polluted=1';
+      }
+    };
+
+    server = http.createServer(function (req, res) {
+      res.end(req.url);
+    }).listen(4444, function () {
+      var instance = axios.create();
+
+      instance.interceptors.request.use(function (config) {
+        return Object.assign({}, config);
+      });
+
+      instance.get('http://localhost:4444/demo', {
+        params: {
+          safe: '1'
+        }
+      }).then(function (res) {
+        clearPrototypePollution();
+        try {
+          assert.equal(res.data, '/demo?safe=1');
+          done();
+        } catch (e) {
+          done(e);
+        }
+      }).catch(function (error) {
+        clearPrototypePollution();
+        done(error);
       });
     });
   });
